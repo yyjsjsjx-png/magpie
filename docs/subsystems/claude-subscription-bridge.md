@@ -985,11 +985,12 @@ is an hour's). Until 11-07 every run was given 1h whatever the pick
 (linkaww). `TestClaudeRunKeepsTheUsersCacheTTL`. Every `savedSession`
 carries its run's `cachePrefix`: the shelf's (`shelve`), and the branches
 cut from a live run's session for a fork's turn (`branch`), a turn sent
-again while its run is busy (`retryBranch`) and the turn after the
+again while its run is busy (`retryBranch`), a new turn after a reply its
+run went on from with another (`turnBranch`) and the turn after the
 interactive mode's side question (`branchAt`). Up to v0.1.3266 the three
-branches carried none, and their runs went back to an hour under a 5m
-pick (linkaww); `everyRunKept5m` in the fork, busy-retry and side
-question tests.
+branches then made carried none, and their runs went back to an hour
+under a 5m pick (linkaww); `everyRunKept5m` in the fork, busy-retry, turn
+branch and side question tests.
 
 `branch` also takes a side request that sends the conversation whole with the
 calls its run still waits on dropped, and the words before them kept: Claude
@@ -1209,7 +1210,7 @@ history to the 1h cache at 2×.
    sent `initialize` first, which Claude Code answers only once it has
    loaded the session; one that can't load it exits 1 ("No conversation
    found with session ID") without answering. `start` then lets the
-   session go and goes on to step 4 in the same request, logged "Claude
+   session go and goes on to step 5 in the same request, logged "Claude
    Code could not go on from the conversation's saved session". Before,
    the turn got 502 "Claude Code ended" with the safety context set, and
    an empty reply without it.
@@ -1229,7 +1230,48 @@ history to the 1h cache at 2×.
    `backLine`), the session can't be copied, the client places its own
    cache marks, or the run was taken back or is being taken back — the
    turn told whole, as before.
-4. `retire`, then a new run. In the interactive mode, a conversation
+4. `subscriptionBridge.turnBranch` when none of those did: a new turn
+   after a reply that a run of the account began a turn at, and went on
+   from with that turn. The client forked the conversation there —
+   DeepSeek Harness's `subagent_fork` starts a sub-agent on the lead's
+   finished turns and a task of its own while the lead's run answers its
+   next turn — or took a turn back and sent another in its place after the
+   run had answered it (a turn further back than the last, which `resume`
+   takes back to through `behindKey`). The last reply calls no tool, so
+   `branch` finds no call line; the turn is no retry of the busy one, so
+   `retryBranch` takes none; a new Claude Code was told the whole
+   conversation, its own system prompt and tools the only part read from
+   the cache (11-17: a fork whose prefix was 135,426 tokens read 21,671 and
+   wrote 113,755). `resume` keeps, as it hands a run its next turn
+   (no side question to take back), where the turn began
+   (`subscriptionRun.turns`, at most `turnsMost`): the key it found the
+   run waiting at (`turnKey`, which becomes `backKey`) and the line and
+   reply it ended at (`lastLine`, `lastMsg`, which become `backLine`,
+   `backMsg`). `turnBranch` finds the run, live or ended with its session
+   kept, with a turn start at the request's own key — the conversation as
+   far as its last reply that calls no tool, under the request's model,
+   settings, system prompt and tools (`nextTurn`) — the latest started run
+   first, and resumes a copy of its session cut after that reply
+   (`cutReply`), typed only the turn's messages. The key is resume's, not
+   the conversation's alone (`conversationKeys`): a session holds what it
+   was told besides the conversation (a `-p` run's first message carries
+   the client's system prompt), and the branch's run is told only the
+   turn, so a fork under other instructions would have gone on under the
+   old ones; it is told whole, as resume would leave such a turn. The run
+   it branched from is not disturbed, and keeps waiting or answering where
+   it was. `nil` when no such run is found, or it was taken back or is
+   being taken back, is of another mode or prompt (`lean`, a `-p` run
+   under the interactive mode), the client places its own cache marks, or
+   the session can't be copied — the turn told whole, as before. A turn
+   whose run waits after the very reply it follows still goes on in that
+   run (`resume`), and tool results for a reply's calls are no new turn
+   (`nextTurn`). `TestClaudeForkWhileItsLeadIsBusyBranchesAfterTheReply`,
+   `TestClaudeTurnSentInPlaceOfAnEarlierOneBranchesAfterTheReplyBefore`,
+   `TestClaudeTurnBranchCopiesTheSessionAsFarAsTheReply`,
+   `TestClaudeTurnUnderOtherInstructionsIsNotBranched`,
+   `TestClaudeTurnBranchCutsAfterTheReplyTheTurnFollows` and
+   `TestClaudeTurnBranchGoesOnFromAnEndedRunsSession` hold it.
+5. `retire`, then a new run. In the interactive mode, a conversation
    with a reply that calls no tool is given to the new Claude Code as
    its own transcript (`replaySession`, in `claude_replay.go`): a session
    file of two lines, a user line holding the conversation before that
@@ -1403,7 +1445,8 @@ with a turn this one doesn't follow, waits under another key (the model,
 settings, system prompt or tools differ), waits at an earlier turn, is
 busy with another request (a turn whose run is busy answering the very
 turn sent again goes on from a copy of its session instead,
-`retryBranch`, so this line is not logged for one), ended (how long ago,
+`retryBranch`, and so does a new turn after a reply a run began a turn
+at, `turnBranch`, so this line is not logged for either), ended (how long ago,
 and why: `endWhy`, set by
 `abortFor`, kept in `b.lost` by conversation), or no run here has had the
 conversation. Tool results that find no run waiting add what became of
@@ -1968,8 +2011,9 @@ in the same `b.mu` section that takes it out of `runs`, so no request
 between finds it in neither. The run object is kept as it ended: its
 session id and folders, the call lines (`lines`, each with the
 conversation its reply answered), `told`, `convKey`, `backLine` and
-`backMsg`, and its mode, owner and prompt flags. Kept: a session on disk
-with a call line or a turn start to cut at (`keepable`). Not kept: a run
+`backMsg`, the starts of the turns it was resumed for (`turns`), and its
+mode, owner and prompt flags. Kept: a session on disk with a call line, a
+turn start or an earlier turn's start to cut at (`keepable`). Not kept: a run
 on the shelf (its file is the shelf's), one whose turn was taken back
 (`rewound`), one with the client's own cache marks, one whose account was
 handed over to Claude Code, and every run as the gateway stops
@@ -1981,12 +2025,14 @@ its files.
 
 `branch` and `retryBranch` look at the kept runs after the live ones, the
 one that ended last first, with the same rules except that a kept run is
-closed. Tool results that come after (the late answer, or a retry of a
-continuation) are cut after the call's line and told the results; a
-delayed AgentSummary on the history before them is cut before the calls
+closed; `turnBranch` looks at both, the latest started run first. Tool
+results that come after (the late answer, or a retry of a continuation)
+are cut after the call's line and told the results; a delayed
+AgentSummary on the history before them is cut before the calls
 (`cutBefore`); a turn sent again after its run ended answering it (a
 retry after a dropped connection) is cut before the turn
-(`backLine`/`backMsg`) and told the turn. A kept session is never taken
+(`backLine`/`backMsg`) and told the turn; a new turn after a reply the
+run began a turn at is cut after that reply (`turns`) and told the turn. A kept session is never taken
 or written: each branch cuts a copy of its own, so the AgentSummary after
 a recovery still branches. The log says the run ended, when, and why
 ("the run this conversation goes on from ended 2m0s ago (it waited as long

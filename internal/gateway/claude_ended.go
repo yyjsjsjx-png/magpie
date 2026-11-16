@@ -13,8 +13,8 @@ import (
 // given two minutes late, 305K for two retried sub-agents and their delayed
 // AgentSummary). The session as Claude Code wrote it, with where each call
 // of the client's tools is in it (lines) and the conversation each reply
-// answered, is what a branch is cut from (branch, retryBranch) as from a
-// live run's: each takes a copy of its own, so the file is never written
+// answered, is what a branch is cut from (branch, retryBranch, turnBranch)
+// as from a live run's: each takes a copy of its own, so the file is never written
 // again, and a later request on the same history (the AgentSummary that
 // comes after the retry) branches off it too.
 //
@@ -33,15 +33,16 @@ type endedRun struct {
 }
 
 // keepable says the session of a run that just ended can be kept for a
-// branch to be cut from: a session on disk with a line or a turn to cut
-// at, Claude Code's own record of its conversation — not one on the shelf
-// already, one whose turn was taken back (rewound, which the file may not
-// say), or one the client marks its own cache in.
+// branch to be cut from: a session on disk with a line, a turn or a turn's
+// start (turns, turnBranch) to cut at, Claude Code's own record of its
+// conversation — not one on the shelf already, one whose turn was taken
+// back (rewound, which the file may not say), or one the client marks its
+// own cache in.
 func (r *subscriptionRun) keepable() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.sessionID != "" && len(r.sessions) > 0 && !r.shelved && !r.clientMarks && !r.rewound &&
-		(len(r.lines) > 0 || r.backLine != "" || r.backMsg != "")
+		(len(r.lines) > 0 || r.backLine != "" || r.backMsg != "" || len(r.turns) > 0)
 }
 
 // keepEnded keeps the session of a run that just ended (keepable) for a

@@ -429,7 +429,26 @@ type subscriptionRun struct {
 	backLine string
 	lastMsg  string
 	backMsg  string
+	// turns is where each turn it was resumed for began, oldest first, at
+	// most turnsMost: the key it waited at (backKey) and the line and reply
+	// it ended at (backLine, backMsg), kept past the turn. A new turn that
+	// goes on from one of those replies after the run went on from it with
+	// another (a fork of the conversation, a turn taken back and sent
+	// anew) branches off the session there (turnBranch). Under mu.
+	turns []turnStart
 }
+
+// turnStart is where in a run's session a turn it was resumed for began:
+// key is what resume found the run waiting at (turnKey: the conversation
+// before the turn, and the model, settings, system prompt and tools it was
+// asked under), and line and msg are the session line and the reply it
+// ended at, as cutReply takes them.
+type turnStart struct {
+	key, line, msg string
+}
+
+// turnsMost is how many turn starts a run keeps (turns).
+const turnsMost = 256
 
 // callLine is the session line of an assistant message block calling a
 // client's tool: its uuid, its place among the run's lines, and the
@@ -2125,6 +2144,17 @@ func (b *subscriptionBridge) resume(req *Request, owner string) (*subscriptionRu
 	run.segment = ch
 	run.active = time.Now()
 	run.turnUUID, run.backKey, run.backLine, run.backMsg = turn, key, run.lastLine, run.lastMsg
+	if back == "" && (run.lastLine != "" || run.lastMsg != "") {
+		// kept past the turn: a fork of the conversation at its last
+		// reply, or a turn sent in place of this one, comes after the run
+		// went on, and branches off its session here (turnBranch). A run
+		// taken back from a side question has lines past the turn's start
+		// (back), and keeps none.
+		run.turns = append(run.turns, turnStart{key: key, line: run.lastLine, msg: run.lastMsg})
+		if len(run.turns) > turnsMost {
+			run.turns = slices.Delete(run.turns, 0, len(run.turns)-turnsMost)
+		}
+	}
 	run.fromLen = 0 // it answered a turn since it started: its lines say where the conversation stood
 	run.allowed = allowedTools(req)
 	run.mu.Unlock()
@@ -3083,6 +3113,99 @@ func (b *subscriptionBridge) retryBranch(req *Request, owner string) *savedSessi
 		return found
 	}
 	log.Printf("claude: a turn sent again while its run is busy answering it goes on in a branch of its session, cut before the turn")
+	return found
+}
+
+// turnBranch is where a new turn goes on from a copy of a run's session,
+// cut after the reply the turn follows, when the run went on from that
+// reply with another turn: the client forked its conversation there
+// (DeepSeek Harness's subagent_fork starts a sub-agent on the lead's
+// finished turns and a task, while the lead's run answers its next turn),
+// or took a turn back and sent another in its place (an edit, a retry
+// with other words) after the run had answered it. Its last reply calls
+// no tool, so branch finds no call line to cut at, and the request is no
+// retry of the busy run's turn: a new Claude Code was told the whole
+// conversation, only its own system prompt and tools read from the cache.
+// The run kept where each turn it was resumed for began (turns); the copy
+// is the conversation as Claude Code asked it of Anthropic, so the
+// branch's run reads the history from the cache and is told only the
+// turn, as a turn after an unshelve is. A turn start is found by the key
+// resume found the run waiting at (turnKey), as resume would find a run
+// waiting there now: a session holds what the request it was told under
+// said besides the conversation — the client's system prompt, which a
+// -p run's first message carries — and the branch's run is told only the
+// turn, so a request asked under another model, settings, system prompt
+// or tools, which resume wouldn't give the run, is told whole as before.
+// nil when no run of the owner, live or ended with its session kept,
+// began a turn there, or the copy can't be made: a client's own cache
+// marks, a session taken back or being taken back, another mode, or no
+// session on disk.
+func (b *subscriptionBridge) turnBranch(req *Request, owner string) *savedSession {
+	if req.clientCache != nil {
+		return nil
+	}
+	key, since := nextTurn(req, owner)
+	if key == "" {
+		return nil
+	}
+	b.mu.Lock()
+	runs := make([]*subscriptionRun, 0, len(b.runs)+len(b.ended))
+	for _, run := range b.runs {
+		if run.owned() == owner {
+			runs = append(runs, run)
+		}
+	}
+	ended := b.endedRuns()
+	for run := range ended {
+		if run.owned() == owner {
+			runs = append(runs, run)
+		}
+	}
+	b.mu.Unlock()
+	var found *savedSession
+	var foundEnded *subscriptionRun
+	var at time.Time
+	for _, run := range runs {
+		_, gone := ended[run]
+		run.mu.Lock()
+		usable := (gone || !run.closed) && run.rewinding == nil && !run.rewound && run.lean == req.leanPrompt &&
+			!run.clientMarks && (run.tui || !wantTUI(req))
+		var start turnStart
+		for _, t := range run.turns {
+			if t.key == key {
+				start = t // the latest
+			}
+		}
+		sid, sessions, appended, tui, prefix, started := run.sessionID, slices.Clone(run.sessions), run.appended, run.tui, run.cachePrefix, run.started
+		run.mu.Unlock()
+		if !usable || start.key == "" || sid == "" || len(sessions) == 0 {
+			continue
+		}
+		if found != nil && !started.After(at) {
+			continue
+		}
+		cut, err := cutReply(sessions, sid, start.line, start.msg)
+		if err != nil {
+			log.Printf("claude: a run's session couldn't be cut after the reply a new turn follows (%v)", err)
+			continue
+		}
+		if found != nil {
+			found.discard() // a newer run's copy is taken: the older one's goes
+		}
+		found, at = &savedSession{session: cut, sessions: sessions, owner: owner, at: time.Now(), since: since, tui: tui, appended: appended, cachePrefix: prefix}, started
+		foundEnded = nil
+		if gone {
+			foundEnded = run
+		}
+	}
+	if found == nil {
+		return nil
+	}
+	if foundEnded != nil {
+		log.Printf("claude: a new turn after a reply its run went on from with another (it ended %s ago: %s) goes on in a branch of the session kept, cut after that reply", time.Since(ended[foundEnded]).Round(time.Second), foundEnded.whyLost())
+		return found
+	}
+	log.Printf("claude: a new turn after a reply its run went on from with another goes on in a branch of its session, cut after that reply")
 	return found
 }
 
@@ -7136,6 +7259,13 @@ func (s *Server) serveClaudeSubscription(w http.ResponseWriter, r *http.Request,
 			// before the turn, and the retry's run reads the history from
 			// the cache, told only the turn
 			from = s.subscription.retryBranch(req, owner)
+		}
+		if from == nil {
+			// a new turn after a reply its run went on from with another
+			// (a fork of the conversation, a turn sent in place of one):
+			// the run goes on from a copy of that run's session, cut
+			// after the reply, told only the turn
+			from = s.subscription.turnBranch(req, owner)
 		}
 		if from == nil {
 			if why := s.subscription.whyNoRun(req, owner); why != "" {

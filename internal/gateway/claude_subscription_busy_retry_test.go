@@ -20,8 +20,9 @@ import (
 // a user line and an assistant line of its own written to the session's
 // file, and answered with its pid and turn. A run resumed from a session
 // answers at once; the second turn of a run started anew holds mid-reply,
-// as one whose client went away without magpie hearing of it does (#5405).
-// It says where the per-run logs are, and the log of what it was told.
+// as one whose client went away without magpie hearing of it does (#5405),
+// unless a file named nohold is beside the told log. It says where the
+// per-run logs are, and the log of what it was told.
 func busyRetryClaude(t *testing.T) (string, string) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
@@ -59,7 +60,7 @@ while read -r line; do
   echo "told $line" >> $log
   echo "told $line" >> ` + told + `
   n=$((n+1))
-  if [ -z "$resumed" ] && [ $n = 2 ]; then
+  if [ -z "$resumed" ] && [ $n = 2 ] && [ ! -f ` + dir + `/nohold ]; then
     sleep 60
     continue
   fi
